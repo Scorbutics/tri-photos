@@ -57,7 +57,7 @@ Une photo est **déjà rangée** si elle se trouve dans `_A_REVOIR/…`, `Voyage
 Les photos déjà rangées servent quand même de référence :
 
 - **Voyages** : une nouvelle photo prise pendant un voyage existant rejoint son dossier, quel que soit son nom actuel. Si de nouvelles photos font se rejoindre deux voyages, chacune va dans celui dont les dates sont les plus proches. Sinon, un nouveau voyage est créé.
-- **Quasi-doublons** : une nouvelle photo semblable à une photo déjà rangée va dans `_A_REVOIR/similaires/<photo de référence>`. Le rapport signale quand la nouvelle est de meilleure qualité : à toi de choisir laquelle garder.
+- **Quasi-doublons** (avec `--revoir-auto`) : une nouvelle photo semblable à une photo déjà rangée va dans `_A_REVOIR/similaires/<photo de référence>`. Le rapport signale quand la nouvelle est de meilleure qualité : à toi de choisir laquelle garder.
 - **Mois, thèmes, catégories** : les nouvelles photos rejoignent les dossiers existants, ou en créent de nouveaux.
 - **Nouveaux groupes** : relance `decouvrir`. Les groupes déjà nommés gardent leur nom.
 
@@ -123,16 +123,30 @@ Dans le dossier de photos (tri sur place) ou dans `--out` :
 ```
 A_trier/            (ou Trie/)
   .tri_photos/      plan, rapport, cache, journaux (dossier de photos uniquement)
-  _A_REVOIR/
-    captures_ecran/  documents/  recus_tickets/  articles_magasin/
-    notes_tableaux/  memes_images_web/  photos_ratees/
-    floues/  trop_sombres/  surexposees/
-    similaires/IMG_1234/ ...      (nommé d'après la photo gardée, elle-même rangée normalement)
   Voyages/
     2024-07-12_Voyage_Sydney/
     2025-01-03_Voyage_FR-JP/      (plusieurs pays = codes pays)
   2024/2024-03/ ...               (tout le reste, par mois)
+  Themes/<nom>/                   (groupes « Dossier thème » de la page de découverte)
+  _A_REVOIR/<nom>/                (groupes « À revoir » de la page de découverte)
 ```
+
+### Rien n'est mis à revoir automatiquement
+
+Par défaut, une photo ou une vidéo ne va dans `_A_REVOIR` que si **tu** l'as décidé, en marquant son groupe « À revoir » dans la page de découverte. Tout le reste suit le tri normal : voyage, sinon mois.
+
+`--revoir-auto` (pour `analyse`, photos comme vidéos) réactive les détections automatiques, qui s'ajoutent à tes choix :
+
+```
+_A_REVOIR/
+  captures_ecran/  documents/  recus_tickets/  articles_magasin/   (photos : modèle d'IA)
+  notes_tableaux/  memes_images_web/  photos_ratees/  messagerie/
+  floues/  trop_sombres/  surexposees/                             (photos : qualité)
+  similaires/IMG_1234/            (quasi-doublons ; la meilleure reste rangée normalement)
+  doublons/  live_photos/  enregistrements_ecran/  tres_courtes/  illisibles/   (vidéos)
+```
+
+Les options `--category-threshold`, `--blur-threshold`, `--dup-threshold`, `--keep`, `--min-duration`… ne servent qu'avec `--revoir-auto`.
 
 ## Réglages utiles
 
@@ -153,9 +167,10 @@ La marque de l'appareil est lue dans les métadonnées. Pour les iPhone, c'est �
 
 Une photo ou une vidéo **sans marque d'appareil** n'a pas été prise par un appareil photo :
 
-- **Format d'écran de téléphone** (1080x2400, 1179x2556…), ou PNG : `_A_REVOIR/captures_ecran`.
-- **Ni date ni lieu** : image ou vidéo reçue (WhatsApp…) ou téléchargée. Sa seule date est celle de son enregistrement sur le téléphone. Elle va dans `_A_REVOIR/messagerie` : les photos, sauf si le modèle lui trouve une catégorie plus précise ; les vidéos, seulement si elles sont en basse définition.
-- **Dans tous les cas**, elle n'est jamais rattachée à un voyage d'après sa date : reçue pendant un voyage, elle n'en fait pas partie. Elle va dans le dossier du mois, avec la mention « origine inconnue » dans le rapport.
+- **Elle n'est jamais rattachée à un voyage d'après sa date** : reçue pendant un voyage, elle n'en fait pas partie. Elle va dans le dossier du mois, avec la mention « origine inconnue » dans le rapport.
+- Avec `--revoir-auto` seulement :
+  - format d'écran de téléphone (1080x2400, 1179x2556…), ou PNG : `_A_REVOIR/captures_ecran` ;
+  - ni date ni lieu (image ou vidéo reçue par WhatsApp…, ou téléchargée) : `_A_REVOIR/messagerie`. Pour les photos, c'est le cas sauf si le modèle leur trouve une catégorie plus précise ; pour les vidéos, seulement en basse définition.
 
 Les catégories sont des phrases en anglais en haut du script (`REVIEW_CATEGORIES`). Tu peux en ajouter, par exemple `"plantes_jardin": ["a photo of a plant label", ...]`.
 
@@ -192,6 +207,8 @@ python tri_videos.py analyse ~/Videos/A_trier --plan-photos ~/Photos/A_trier
 ```
 
 Si le plan des photos existe, une vidéo prise pendant un voyage trouvé par les photos va dans ce voyage, même sans GPS. Lance donc `tri_photos.py analyse` avant. Le script prend `.tri_photos/plan.csv` dans le dossier analysé, ou ce que désigne `--plan-photos` : un dossier de photos ou directement un `plan.csv`.
+
+Avec `--revoir-auto` seulement :
 
 | À revoir | Comment c'est détecté |
 |---|---|

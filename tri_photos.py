@@ -333,8 +333,11 @@ def settle_photo_group(members: list[Photo], keep: int, gid: int) -> bool:
     return True
 
 
-def analyse(args) -> None:
-    photos, images, clip, out = load_photos(args)
+def build_plan(args, photos: list[Photo], images: list[Photo], clip, out: Path,
+               use_categories: bool = True):
+    """Décide la destination de chaque photo (p.destination, p.reason) sans rien écrire.
+    use_categories=False : sans les groupes de la page de découverte, c'est-à-dire le
+    « tri normal » que la page montre en aperçu. Renvoie le modèle CLIP (chargé ou None)."""
     src = out.parent
 
     # --- photos déjà rangées : elles gardent leur place (sauf --tout-refaire)
@@ -345,20 +348,28 @@ def analyse(args) -> None:
     pinned = len(photos) - len(new)
     if pinned:
         log(f"{pinned} photos déjà rangées (laissées en place), {len(new)} nouvelles à ranger.")
+    # Par défaut, rien ne part automatiquement dans _A_REVOIR : seuls les groupes que tu
+    # as marqués « À revoir » dans la page de découverte y vont. --revoir-auto réactive
+    # les détections automatiques (étapes 1 à 3 : catégories, qualité, quasi-doublons).
+    auto = args.revoir_auto
+    if not auto:
+        for p in new:
+            if p.quality_flag == "illisible":  # rangée normalement, par sa date
+                p.quality_flag = ""
 
     # --- 0. catégories découvertes et nommées par toi (prioritaires).
     # Le fichier donné est recopié dans .tri_photos/ : decouvrir y retrouve les noms
     # et les analyses suivantes l'utilisent sans avoir à le repasser.
     cats_file = out / "categories.json"
-    if args.categories:
+    if args.categories and use_categories:
         given = Path(args.categories).expanduser().resolve()
         if given != cats_file:
             shutil.copyfile(given, cats_file)
-    if cats_file.exists() and new:
+    if use_categories and cats_file.exists() and new:
         apply_discovered(new, cats_file)
 
-    # --- 1. catégories prédéfinies (texte), pour les nouvelles photos
-    if new:
+    # --- 1. catégories prédéfinies (texte), pour les nouvelles photos (--revoir-auto)
+    if new and auto:
         if clip is None:
             clip = Clip(args.model, args.pretrained)
         rev_names, rev_vecs = clip.encode_categories(REVIEW_CATEGORIES)
@@ -372,7 +383,7 @@ def analyse(args) -> None:
              for k, prompt in enumerate(prompts)})
         all_names = rev_names + keep_names
         all_vecs = np.concatenate([rev_vecs, keep_vecs])
-    for p in new:
+    for p in (new if auto else []):
         if p.emb is None or p.category or p.theme:
             continue
         logits = 100.0 * all_vecs @ p.emb
@@ -397,8 +408,8 @@ def analyse(args) -> None:
             p.category_note = ("ni appareil ni date : image reçue (WhatsApp…) ou téléchargée, "
                                "datée de son enregistrement sur le téléphone")
 
-    # --- 2. qualité (seulement pour les nouvelles photos non catégorisées)
-    for p in new:
+    # --- 2. qualité (seulement pour les nouvelles photos non catégorisées, --revoir-auto)
+    for p in (new if auto else []):
         if p.category or p.emb is None:
             continue
         if p.brightness < 25 or p.clipped_dark > 0.85:
@@ -428,7 +439,7 @@ def analyse(args) -> None:
         return i
 
     times = [dt.datetime.fromisoformat(p.date) for p in normal]
-    if normal and new:
+    if normal and new and auto:  # (--revoir-auto)
         E = np.stack([p.emb for p in normal])
         win = dt.timedelta(minutes=args.dup_window_min)
         for i in range(len(normal)):
@@ -518,6 +529,13 @@ def analyse(args) -> None:
         elif not p.dup_keep:
             p.destination, p.reason = p.dup_folder, p.dup_note
 
+    return clip
+
+
+def analyse(args) -> None:
+    photos, images, clip, out = load_photos(args)
+    src = out.parent
+    build_plan(args, photos, images, clip, out)
     write_plan(out, photos)
     write_report(out, photos)
     summary(photos)
@@ -734,6 +752,11 @@ def discover(args) -> None:
     from scipy.cluster.hierarchy import fcluster, linkage
 
     photos, images, clip, out = load_photos(args)
+    # Aperçu du « tri normal » : la destination qu'aurait chaque photo sans les groupes
+    # de la page (voyage, mois, catégories prédéfinies, doublons…). Rien n'est écrit.
+    log("Aperçu du tri normal…")
+    clip = build_plan(analyse_defaults(str(src), model=args.model, pretrained=args.pretrained),
+                      photos, images, clip, out, use_categories=False)
     imgs = [p for p in images if p.emb is not None]
     n_videos = 0
     if args.videos:  # les vidéos sont regroupées avec les photos (empreinte de 3 de leurs images)
@@ -743,10 +766,17 @@ def discover(args) -> None:
         clip = clip or Clip(args.model, args.pretrained)
         embs, clip = tri_videos.video_embeddings(vwork, vids, args.model, args.pretrained, clip)
         tri_videos.make_video_thumbs(vwork, vids)
+        # destination « tri normal » des vidéos : celle du plan déjà calculé par tri_videos.py
+        vplan = {}
+        if (vwork / tri_videos.PLAN_CSV).exists():
+            with open(vwork / tri_videos.PLAN_CSV, newline="") as f:
+                vplan = {r["source"]: r["destination"] for r in csv.DictReader(f)
+                         if "ressemble" not in r["raison"]}  # pas les choix d'une page précédente
         for v in vids:
             if v.path in embs and v.thumb:
                 imgs.append(Photo(path=v.path, date=v.date, emb=embs[v.path],
-                                  thumb_src=str(vwork / v.thumb)))
+                                  thumb_src=str(vwork / v.thumb),
+                                  destination=vplan.get(v.path, "")))
                 n_videos += 1
         log(f"{n_videos} vidéos ajoutées au regroupement.")
     if len(imgs) < 2:
@@ -791,11 +821,19 @@ def discover(args) -> None:
     log(f"Vignettes de {sum(map(len, ordered))} photos…")
     thumbs = make_thumbs(out, [p for members in ordered for p in members])
     k = 0
+    dests: list[str] = []          # destinations « tri normal », référencées par indice
+    index: dict[str, int] = {}
     for cl, members in zip(clusters, ordered):
         cl["photos"] = thumbs[k:k + len(members)]
+        for p in members:
+            if p.destination not in index:
+                index[p.destination] = len(dests)
+                dests.append(p.destination)
+        cl["d"] = [index[p.destination] for p in members]
         k += len(members)
     restore_choices(clusters, out)
     data = {"source": str(src), "total": len(imgs), "videos": n_videos, "small": small,
+            "dests": dests,
             "grain": args.grain,
             "clusters": clusters}
     atomic_write_text(out / "decouverte.json", json.dumps(data))
@@ -890,9 +928,21 @@ button{font:inherit}
 .sugg{font-size:12px;color:var(--muted)}
 .sugg a{color:var(--accent);cursor:pointer;margin-left:6px;text-decoration:none}
 .sugg a:hover{text-decoration:underline}
-.parts{font-size:12px;color:var(--muted);margin:0 0 8px;display:flex;flex-wrap:wrap;gap:4px 10px}
-.parts span{background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:1px 4px 1px 9px}
-.parts a{color:var(--accent);cursor:pointer;margin-left:4px;text-decoration:none;padding:0 4px}
+.parts{font-size:12px;color:var(--muted);margin:0 0 8px}
+/* fusion : une section par groupe d'origine, de la couleur du groupe */
+.sub{border-left:4px solid var(--c);padding:2px 0 2px 8px;margin:0 0 10px}
+.subhead{display:flex;align-items:center;gap:8px;font-size:13px;margin:0 0 5px;color:#ddd}
+.subhead .tag{background:var(--c);color:#111;font-weight:700;border-radius:4px;padding:0 6px}
+.subhead .rest{color:var(--muted);font-size:12px}
+.subhead a{color:var(--accent);cursor:pointer;text-decoration:none;font-size:12px}
+.subhead a:hover{text-decoration:underline}
+.subhead .tag.folder{font-family:ui-monospace,monospace;font-weight:600}
+.viewseg button[aria-pressed=true]{background:#eee;color:#111;font-weight:600}
+.destsum{color:var(--muted);font-size:12px}.destsum code{font-size:11px}
+.destsum a{color:var(--accent);cursor:pointer}
+.thumbs .from{position:relative;display:inline-block;line-height:0}
+.thumbs .from::before{content:attr(data-g);position:absolute;right:3px;top:3px;z-index:1;background:var(--c);
+  color:#111;font:700 10px/1.4 system-ui,sans-serif;border-radius:3px;padding:0 4px;pointer-events:none}
 .thumbs{display:flex;flex-wrap:wrap;gap:4px}
 .thumbs img{width:104px;height:78px;object-fit:cover;border-radius:3px;background:#222;transition:transform .12s;cursor:zoom-in}
 .thumbs img:hover{transform:scale(2.2);position:relative;z-index:3;box-shadow:0 4px 18px #000}
@@ -953,6 +1003,7 @@ est déjà en cache, et tes choix seront repris.</div>
 
 <div class=bar>
   <div class=progress><div class=txt id=progressTxt></div><div class=track><div class=fill id=progressFill></div></div></div>
+  <div class="seg viewseg" id=viewSeg role=group aria-label="Vue"></div>
   <div class=filters id=filters></div>
   <input type=search id=search placeholder="Chercher un nom…">
   <button class="btn merge" id=mergeBtn hidden>Fusionner</button>
@@ -982,13 +1033,15 @@ const C = DATA.clusters;                       // groupes trouvés par le script
 const N = C.length;
 const LABEL = {garder: 'Tri normal', revoir: 'À revoir', theme: 'Dossier thème'};
 const STORE = 'decouverte:' + DATA.source;     // une mémoire par dossier, qui survit à une nouvelle découverte
-const SHOWN = 18;
+const SHOWN = 18;          // vignettes montrées d'un groupe avant « Voir les N photos »
+const PER_GROUP = 6;       // … par groupe d'origine dans une fusion
 C.forEach((c, i) => { c.i = i; c.photos = c.photos || c.exemples || []; c.vu = !!c.vu; });
 const byId = Object.fromEntries(C.map(c => [c.id, c]));
 
 // État de la page : choix par groupe (dans C), niveau de regroupement, fusions et séparations manuelles.
 let level = 0, links = [], detached = new Set(), selected = new Set(), expanded = new Set();
-let filter = 'tous', query = '';
+let filter = 'tous', query = '', view = 'groupes';
+function setView(v) { view = v; render(); }
 
 function dot(a, b) { let s = 0; for (let k = 0; k < a.length; k++) s += a[k] * b[k]; return s; }
 function safeName(s) {  // même règle que le script (nom du dossier)
@@ -1098,8 +1151,8 @@ function card(comp) {
   box.onchange = () => { box.checked ? selected.add(c.id) : selected.delete(c.id); updateSelection(); sec.classList.toggle('selected', box.checked); };
   const input = el('input', {value: c.nom, 'aria-label': 'Nom du groupe ' + (c.i + 1)});
   const effect = el('div', {class: 'effect'});
-  effect.innerHTML = effectText(comp);
-  input.oninput = () => { c.nom = input.value.trim(); c.vu = true; persist(); effect.innerHTML = effectText(comp); updateCounts(); };
+  effect.innerHTML = effectText(comp) + destSummary(comp);
+  input.oninput = () => { c.nom = input.value.trim(); c.vu = true; persist(); effect.innerHTML = effectText(comp) + destSummary(comp); updateCounts(); };
   const seg = el('div', {class: 'seg', role: 'group', 'aria-label': 'Que faire de ce groupe ?'});
   for (const a of ['garder', 'revoir', 'theme']) {
     seg.append(el('button', {'data-a': a, type: 'button', 'aria-pressed': c.action === a,
@@ -1112,30 +1165,87 @@ function card(comp) {
     el('div', {class: 'num'}, box, el('b', {}, '#' + (c.i + 1)), countLabel(comp)),
     el('div', {class: 'name'}, el('label', {}, 'Nom (dossier)'), input), seg, sugg);
   const sec = el('section', {class: 'group ' + c.action + (c.vu ? '' : ' unseen') + (selected.has(c.id) ? ' selected' : ''), id: 'g' + (c.i + 1)}, head, effect);
-  if (multi) {
-    const parts = el('div', {class: 'parts'}, `Fusion de ${comp.members.length} groupes :`);
-    for (const m of comp.members) {
-      parts.append(el('span', {}, `#${m.i + 1} · ${m.nb} photos`,
-        el('a', {title: 'Sortir ce groupe de la fusion', onclick: () => split(m, comp)}, '✕ séparer')));
-    }
-    sec.append(parts);
-  }
   const all = comp.members.flatMap(m => m.photos);
-  const thumbs = el('div', {class: 'thumbs'});
   const open = expanded.has(c.id);
-  for (const p of open ? all : all.slice(0, SHOWN)) {
-    const img = el('img', {loading: 'lazy', src: p, alt: ''});
-    thumbs.append(p.includes('/v_') ? el('span', {class: 'vid', title: 'Vidéo'}, img) : img);
+  // chaque vignette avec son groupe d'origine et la destination qu'elle aurait avec le choix actuel
+  const items = comp.members.flatMap((m, k) => m.photos.map((p, j) =>
+    ({p, m, k, dest: effDest(m.d ? m.d[j] : -1, c)})));
+  if (multi) sec.append(el('div', {class: 'parts'}, `Fusion de ${comp.members.length} groupes (une couleur par groupe d'origine) :`));
+  let sections = null;
+  if (view === 'destinations' && HAS_DESTS) {  // une section par dossier de destination
+    const by = new Map();
+    for (const it of items) { if (!by.has(it.dest)) by.set(it.dest, []); by.get(it.dest).push(it); }
+    sections = [...by.entries()].sort((a, b) => b[1].length - a[1].length)
+      .map(([dest, list]) => ({tag: dest || 'destination inconnue', label: itemsLabel(list), list, color: DEST_COLOR, dest: true}));
+  } else if (multi) {  // une section par groupe d'origine
+    sections = comp.members.map((m, k) => ({tag: '#' + (m.i + 1), label: memberLabel(m),
+      list: items.filter(it => it.m === m), color: groupColor(k), member: m}));
   }
-  sec.append(thumbs);
+  if (sections) {
+    for (const s of sections) {
+      const shown = open ? s.list : s.list.slice(0, PER_GROUP);
+      const head = el('div', {class: 'subhead'}, el('span', {class: 'tag' + (s.dest ? ' folder' : '')}, s.tag), s.label);
+      if (shown.length < s.list.length) head.append(el('span', {class: 'rest'}, `(${shown.length} montrées)`));
+      if (s.member) head.append(el('a', {title: 'Sortir ce groupe de la fusion', onclick: () => split(s.member, comp)}, '✕ séparer'));
+      const thumbs = el('div', {class: 'thumbs'});
+      for (const it of shown) thumbs.append(thumb(it.p, multi ? it.m : null, groupColor(it.k)));
+      const sub = el('div', {class: 'sub'}, head, thumbs);
+      sub.style.setProperty('--c', s.color);
+      sec.append(sub);
+    }
+  } else {
+    const thumbs = el('div', {class: 'thumbs'});
+    for (const p of open ? all : all.slice(0, SHOWN)) thumbs.append(thumb(p));
+    sec.append(thumbs);
+  }
   const partial = comp.members.some(m => m.partiel);
-  if (all.length > SHOWN) {
+  const hidden = sections ? sections.some(x => x.list.length > PER_GROUP) : all.length > SHOWN;
+  if (hidden || (open && all.length > SHOWN)) {
     sec.append(el('button', {class: 'more', type: 'button', onclick: () => { open ? expanded.delete(c.id) : expanded.add(c.id); render(); }},
-      open ? 'Réduire' : `Voir les ${all.length} photos`));
+      open ? 'Réduire' : `Voir les ${all.length} photos${sections ? (view === 'destinations' ? ', dossier par dossier' : ', groupe par groupe') : ''}`));
   } else if (partial && comp.nb > all.length) {
     sec.append(el('p', {class: 'sugg'}, `${all.length} photos montrées sur ${comp.nb} (ancienne découverte, voir l'encadré en haut).`));
   }
   return sec;
+}
+// --- Aperçu des destinations (calculé par le script : le « tri normal » de chaque photo)
+const HAS_DESTS = Array.isArray(DATA.dests);
+const DEST_COLOR = '#9fb3c8';
+const KEEPS_NORMAL = /^_A_REVOIR\/(floues|trop_sombres|surexposees|similaires)(\/|$)/;
+function effDest(idx, c) {  // même logique que l'analyse
+  const normal = HAS_DESTS && idx >= 0 ? DATA.dests[idx] : '';
+  if (c.action === 'revoir') return '_A_REVOIR/' + safeName(c.nom);
+  if (c.action === 'theme')  // une photo de voyage reste dans le voyage ; floue/doublon reste à revoir
+    return normal.startsWith('Voyages/') || KEEPS_NORMAL.test(normal) ? normal : 'Themes/' + safeName(c.nom);
+  return normal;
+}
+function itemsLabel(list) {
+  const v = list.filter(it => it.p.includes('/v_')).length, p = list.length - v;
+  return [p ? `${p} photo${p > 1 ? 's' : ''}` : '', v ? `${v} vidéo${v > 1 ? 's' : ''}` : ''].filter(Boolean).join(' · ');
+}
+function destSummary(comp) {
+  if (!HAS_DESTS) return '';
+  const n = new Map();
+  for (const m of comp.members) (m.d || []).forEach(i => { const d = effDest(i, comp.master) || 'destination inconnue'; n.set(d, (n.get(d) || 0) + 1); });
+  const top = [...n.entries()].sort((a, b) => b[1] - a[1]);
+  return '<br><span class=destsum>Destinations : ' + top.slice(0, 4).map(([d, k]) => `<code>${esc(d)}</code> ${k}`).join(' · ')
+    + (top.length > 4 ? ` · <a onclick="setView('destinations')">+ ${top.length - 4} autre(s) dossier(s)</a>` : '') + '</span>';
+}
+// couleurs bien distinctes, attribuées dans l'ordre des groupes d'une même fusion
+const PALETTE = ['#f28b82', '#fbbc04', '#81c995', '#78d9ec', '#aecbfa', '#d7aefb', '#fdcfe8',
+                 '#e6c9a8', '#ccff90', '#ff8a65', '#a7ffeb', '#c5cae9'];
+function groupColor(k) { return PALETTE[k % PALETTE.length]; }
+function thumb(p, m, color) {  // vignette ; dans une fusion, avec le numéro et la couleur de son groupe d'origine
+  let node = el('img', {loading: 'lazy', src: p, alt: ''});
+  if (p.includes('/v_')) node = el('span', {class: 'vid', title: 'Vidéo'}, node);
+  if (!m) return node;
+  const tagged = el('span', {class: 'from', 'data-g': '#' + (m.i + 1), title: `Groupe #${m.i + 1}`}, node);
+  tagged.style.setProperty('--c', color);
+  return tagged;
+}
+function memberLabel(m) {
+  const v = m.videos || 0, p = m.nb - v;
+  return [p ? `${p} photo${p > 1 ? 's' : ''}` : '', v ? `${v} vidéo${v > 1 ? 's' : ''}` : ''].filter(Boolean).join(' · ');
 }
 function countLabel(comp) {
   const v = comp.members.reduce((s, m) => s + (m.videos || 0), 0), p = comp.nb - v;
@@ -1146,7 +1256,7 @@ function render() {
   const list = document.getElementById('list');
   list.replaceChildren(...comps.filter(visible).map(card));
   document.getElementById('empty').hidden = list.children.length > 0;
-  updateCounts(); updateSelection();
+  updateCounts(); updateSelection(); updateView();
   document.getElementById('level').value = level;
   document.getElementById('levelTxt').textContent =
     level ? `${comps.length} groupes (au lieu de ${N})` : `${comps.length} groupes (découverte d'origine)`;
@@ -1161,6 +1271,14 @@ function updateCounts() {
   f.replaceChildren(...[['tous', `Tous (${comps.length})`], ['nonvus', `Pas encore vus (${comps.length - seen})`],
     ['revoir', `À revoir (${counts.revoir})`], ['theme', `Thème (${counts.theme})`], ['garder', `Tri normal (${counts.garder})`]]
     .map(([k, lab]) => el('button', {type: 'button', 'aria-pressed': filter === k, onclick: () => { filter = k; render(); }}, lab)));
+}
+function updateView() {
+  const vs = document.getElementById('viewSeg');
+  vs.hidden = !HAS_DESTS;
+  vs.replaceChildren(...[['groupes', 'Vue : groupes'], ['destinations', 'Vue : destinations']].map(([k, lab]) =>
+    el('button', {type: 'button', 'aria-pressed': view === k, title: k === 'destinations'
+      ? 'Ranger les vignettes de chaque groupe par dossier de destination, selon le choix actuel' : 'Ranger les vignettes par groupe d\'origine',
+      onclick: () => setView(k)}, lab)));
 }
 function updateSelection() {
   const n = selected.size;
@@ -1270,7 +1388,18 @@ def apply_discovered(images: list[Photo], path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def analyse_defaults(source: str, **overrides) -> argparse.Namespace:
+    """Options de la commande analyse avec leurs valeurs par défaut (un seul endroit)."""
+    args = build_parser().parse_args(["analyse", source])
+    vars(args).update(overrides)
+    return args
+
+
 def main() -> None:
+    run_command(build_parser().parse_args())
+
+
+def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1305,8 +1434,7 @@ def main() -> None:
     d.add_argument("--pretrained", default=DEFAULT_PRETRAINED)
     d.set_defaults(func=discover)
     PLAN.add_commands(sub)
-    args = ap.parse_args()
-    run_command(args)
+    return ap
 
 
 if __name__ == "__main__":

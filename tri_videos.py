@@ -380,9 +380,14 @@ def analyse(args) -> None:
     def already(ref: Video) -> str:
         return " (déjà rangée)" if ref.pinned else ""
 
+    # Par défaut, rien ne part automatiquement dans _A_REVOIR : seuls les groupes marqués
+    # « À revoir » dans la page de découverte y vont (étape 4b). --revoir-auto réactive
+    # les détections automatiques des étapes 1 à 4.
+    auto = args.revoir_auto
+
     # --- 1. copies exactes (nouvelles vidéos comparées aussi aux vidéos déjà rangées)
     gid = 0
-    for g in exact_duplicates(videos):
+    for g in (exact_duplicates(videos) if auto else []):
         settled = settle_group(g, 1, gid + 1, quality_rank)
         if not settled:
             continue
@@ -392,7 +397,7 @@ def analyse(args) -> None:
             v.category, v.reason = "doublons", f"copie exacte de {ref.name}{already(ref)}"
 
     # --- 2. illisibles, Live Photos, enregistrements d'écran
-    for v in new:
+    for v in (new if auto else []):
         if not v.category:
             v.category, v.reason = classify(v, stems, args)
 
@@ -402,7 +407,7 @@ def analyse(args) -> None:
             if (not v.pinned and not v.category)
             or (v.pinned and (not v.pinned.startswith("_A_REVOIR")
                               or v.pinned.startswith("_A_REVOIR/similaires/")))]
-    for g in near_duplicates(pool, args.dup_tolerance, args.dup_min_duration):
+    for g in (near_duplicates(pool, args.dup_tolerance, args.dup_min_duration) if auto else []):
         settled = settle_group(g, args.keep, gid + 1, quality_rank)
         if not settled:
             continue
@@ -415,7 +420,7 @@ def analyse(args) -> None:
                         f"({v.width}x{v.height} vs {ref.width}x{ref.height})")
 
     # --- 4. messagerie et vidéos très courtes
-    for v in new:
+    for v in (new if auto else []):
         if v.category or not v.dup_keep:
             continue
         if is_messaging(v):

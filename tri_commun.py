@@ -476,6 +476,10 @@ def add_common_analyse_args(a: argparse.ArgumentParser, what: str) -> None:
     a.add_argument("--tout-refaire", action="store_true",
                    help=f"re-trier aussi les {what} déjà rangées (_A_REVOIR/, Voyages/, "
                         "Themes/, AAAA/AAAA-MM/) au lieu de les laisser en place")
+    a.add_argument("--revoir-auto", action="store_true",
+                   help=f"mettre aussi de côté dans _A_REVOIR les {what} détectées automatiquement "
+                        "(captures d'écran, floues, doublons…). Par défaut, seuls les groupes "
+                        "marqués « À revoir » dans la page de découverte y vont.")
     a.add_argument("--home-lat", type=float, default=-27.4698)   # Brisbane
     a.add_argument("--home-lon", type=float, default=153.0251)
     a.add_argument("--trip-km", type=float, default=100,
