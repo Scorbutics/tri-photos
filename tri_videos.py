@@ -47,14 +47,15 @@ import html
 import os
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from tri_commun import (IMAGE_EXT, PLAN_DIR, Plan, add_common_analyse_args, atomic_open,
-                        atomic_write_text, find_trips, log, parse_exif_date, run_command,
-                        run_exiftool, settle_group, similar_folder, sorted_folder, trip_label,
-                        work_dir)
+from tri_commun import (DEFAULT_MODEL, DEFAULT_PRETRAINED, IMAGE_EXT, PLAN_DIR, Every, Plan,
+                        add_common_analyse_args, atomic_open, atomic_write_text, file_id,
+                        find_trips, log, parse_exif_date, run_command, run_exiftool,
+                        settle_group, similar_folder, sorted_folder, trip_label, work_dir)
 
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".3gp", ".avi", ".mkv", ".mts", ".m2ts",
              ".wmv", ".mpg", ".mpeg", ".webm"}
@@ -98,10 +99,19 @@ class Video:
     pinned: str = ""               # dossier actuel si déjà rangée (on n'y touche pas)
     destination: str = ""
     reason: str = ""
+    thumb: str = ""                # vignette (une image de la vidéo), si ffmpeg est installé
+    theme: str = ""                # groupe « Dossier thème » de la page de découverte
 
     @property
     def name(self) -> str:
         return Path(self.path).name
+
+    @property
+    def has_origin(self) -> bool:
+        """Filmée par un appareil identifiable (marque, lieu ou Live Photo). Sinon : vidéo
+        reçue (WhatsApp…), téléchargée ou exportée par une appli : sa date est celle de
+        l'enregistrement sur le téléphone et rien ne dit où elle a été filmée."""
+        return bool(self.make or self.model or self.lat is not None or self.content_id)
 
     @property
     def has_meta_date(self) -> bool:
@@ -142,7 +152,10 @@ def read_metadata(files: list[Path], quicktime_utc: bool, cache: Path) -> dict[s
             "-TrackCreateDate", "-GPSLatitude", "-GPSLongitude", "-GPSCoordinates",
             "-Make", "-Model", "-Software", "-Encoder", "-Duration", "-ImageWidth",
             "-ImageHeight", "-Rotation", "-VideoFrameRate", "-AvgBitrate",
-            "-ContentIdentifier", "-Error"]
+            "-ContentIdentifier", "-Error",
+            # appareils Android : la marque/le modèle sont dans des balises propres au constructeur
+            "-SamsungModel", "-AndroidMake", "-AndroidManufacturer", "-AndroidModel",
+            "-AndroidVersion"]
     # Les dates QuickTime (CreateDate...) sont stockées en UTC : exiftool les
     # convertit dans le fuseau de cet ordinateur. CreationDate (iPhone) porte
     # déjà son propre fuseau et reste en heure locale du lieu de prise de vue.
@@ -184,6 +197,14 @@ def build_video(f: Path, m: dict) -> Video:
 
     v.make = str(m.get("Make") or "").strip()
     v.model = str(m.get("Model") or "").strip()
+    if not v.make and not v.model:  # téléphone Android : balises du constructeur
+        if m.get("SamsungModel"):
+            v.make, v.model = "Samsung", str(m["SamsungModel"]).strip()
+        elif m.get("AndroidModel") or m.get("AndroidMake") or m.get("AndroidManufacturer"):
+            v.make = str(m.get("AndroidMake") or m.get("AndroidManufacturer") or "Android").strip()
+            v.model = str(m.get("AndroidModel") or "").strip()
+        elif m.get("AndroidVersion"):
+            v.make = "Android"
     v.software = str(m.get("Software") or m.get("Encoder") or "").strip()
     v.duration = num(m.get("Duration"))
     v.width, v.height = int(num(m.get("ImageWidth"))), int(num(m.get("ImageHeight")))
@@ -236,7 +257,8 @@ def exact_duplicates(videos: list[Video]) -> list[list[Video]]:
 
 def near_duplicates(videos: list[Video], tol_s: float, min_dur: float) -> list[list[Video]]:
     """Ré-encodages : même durée (à tol_s près), même orientation/format, et
-    prises au même moment (ou le même jour si l'une n'a qu'une date de nom/fichier)."""
+    prises au même moment, à 2 s près (ou le même jour si l'une n'a qu'une date de
+    nom/fichier : copie WhatsApp & co, qui perd les métadonnées)."""
     vs = sorted((v for v in videos if v.duration >= min_dur), key=lambda v: v.duration)
     parent = list(range(len(vs)))
 
@@ -254,7 +276,9 @@ def near_duplicates(videos: list[Video], tol_s: float, min_dur: float) -> list[l
             same_shape = ((a.width >= a.height) == (b.width >= b.height)
                           and abs(a.aspect - b.aspect) < 0.05)
             if a.has_meta_date and b.has_meta_date:
-                close = abs(ts[i] - ts[j]) <= dt.timedelta(minutes=2)
+                # une copie ré-encodée qui garde sa date la garde à la seconde près ;
+                # deux prises de même durée à une minute d'écart sont deux vidéos différentes
+                close = abs(ts[i] - ts[j]) <= dt.timedelta(seconds=2)
             else:
                 close = abs(ts[i] - ts[j]) <= dt.timedelta(days=1)
             if same_shape and close:
@@ -396,8 +420,43 @@ def analyse(args) -> None:
             continue
         if is_messaging(v):
             v.category, v.reason = "messagerie", "reçue par messagerie"
+        elif (not v.has_origin and not v.has_meta_date
+              and max(v.width, v.height) <= 1280 and v.bitrate < 3e6):
+            v.category, v.reason = ("messagerie", "ni appareil ni date, basse définition : "
+                                                  "probablement reçue par messagerie")
         elif v.duration < args.min_duration:
             v.category, v.reason = "tres_courtes", f"{v.duration:.1f} s"
+
+    # --- 4b. groupes nommés dans la page de découverte (categories.json) : une vidéo qui
+    # ressemble à un groupe « À revoir » ou « Dossier thème » suit le même choix
+    groups_file = find_categories(args, out) if args.ia else None
+    if groups_file:
+        try:
+            from tri_ia import Groups
+        except ImportError as e:
+            log(f"! IA indisponible ({e}) : les groupes de {groups_file} ne sont pas appliqués "
+                "aux vidéos (installe les dépendances de tri_photos.py, ou --sans-ia).")
+            groups_file = None
+    if groups_file:
+        groups = Groups(groups_file)
+        cands = [v for v in new if not v.category and v.dup_keep and v.duration > 0]
+        if groups and cands:
+            embs, _ = video_embeddings(out, cands, args.model, args.pretrained)
+            n = 0
+            for v in cands:
+                found = groups.match(embs.get(v.path))
+                if not found:
+                    continue
+                action, nom = found
+                if action == "revoir":
+                    v.category, v.reason = nom, f"ressemble au groupe « {nom} » (page de découverte)"
+                else:
+                    v.theme = nom
+                n += 1
+            log(f"Groupes de {groups_file} : {n} vidéo(s) rattachée(s) à {len(groups)} groupe(s).")
+    elif args.ia:
+        log("Pas de categories.json : pas de thèmes pour les vidéos "
+            "(voir tri_photos.py decouvrir … --videos).")
 
     # --- 5. voyages / mois (nouvelles vidéos). Une vidéo prise pendant un voyage déjà
     # rangé (photos ou vidéos) rejoint son dossier, quel que soit son nom actuel.
@@ -412,7 +471,12 @@ def analyse(args) -> None:
             s = own.setdefault(v.pinned, [d, d])
             s[0], s[1] = min(s[0], d), max(s[1], d)
     video_spans = sorted((a - margin, b + margin, dest) for dest, (a, b) in own.items())
+    # une vidéo d'origine inconnue (reçue pendant un voyage, par exemple) n'est pas
+    # rattachée à un voyage d'après sa date : elle va dans le dossier du mois
+    unknown = {i for i, v in enumerate(kept) if not v.has_origin}
     for i, t in enumerate(ts):
+        if i in unknown:
+            continue
         for a, b, dest in video_spans:
             if a <= t <= b:
                 assigned[i] = dest
@@ -427,7 +491,7 @@ def analyse(args) -> None:
     if plan_photos.exists():
         spans = photo_trips(plan_photos, args.trip_margin_hours)
         for i, t in enumerate(ts):
-            if i in assigned:
+            if i in assigned or i in unknown:
                 continue
             for a, b, dest in spans:
                 if a <= t <= b:
@@ -440,7 +504,7 @@ def analyse(args) -> None:
 
     home = (args.home_lat, args.home_lon)
     # vidéos pas encore rattachées à un voyage : voyages détectés par leur propre GPS
-    rest = [i for i in range(len(kept)) if i not in assigned]
+    rest = [i for i in range(len(kept)) if i not in assigned and i not in unknown]
     found = find_trips([kept[i] for i in rest], [ts[i] for i in rest], home,
                        args.trip_km, args.trip_gap_days)
     for t in ([rest[k] for k in trip] for trip in found):
@@ -454,8 +518,13 @@ def analyse(args) -> None:
     for i, v in enumerate(kept):
         if i in assigned:
             v.destination, v.reason = assigned[i], "voyage"
+        elif v.theme:  # thème, sauf pendant un voyage (comme les photos)
+            v.destination, v.reason = f"Themes/{v.theme}", f"ressemble au thème « {v.theme} »"
         else:
-            v.destination, v.reason = f"{ts[i]:%Y}/{ts[i]:%Y-%m}", "mois"
+            v.destination, v.reason = f"{ts[i]:%Y}/{ts[i]:%Y-%m}", (
+                "mois" if i not in unknown else
+                "mois · origine inconnue (ni appareil ni lieu : reçue ou exportée ?), "
+                "datée de son enregistrement sur le téléphone")
     for v in videos:
         if v.destination:
             continue
@@ -466,6 +535,10 @@ def analyse(args) -> None:
         else:
             v.destination = v.dup_folder
 
+    if args.vignettes:
+        # les vidéos montrées dans le rapport : celles qui vont bouger, et les gardées de leurs groupes
+        shown = [v for v in videos if not v.pinned or (v.dup_group and v.dup_keep)]
+        make_video_thumbs(out, shown)
     write_plan(out, videos)
     write_report(out, videos)
     summary(videos)
@@ -503,6 +576,174 @@ def write_plan(out: Path, videos: list[Video]) -> None:
                         v.dup_group or "", "oui" if v.dup_keep else "non"])
 
 
+def make_video_thumb(out: Path, v: Video) -> str:
+    """Une image de la vidéo (à 1 s, ou au milieu si elle est plus courte), réduite à
+    240 px de haut. ffmpeg applique la rotation de l'iPhone. Réutilisée si elle existe."""
+    thumbs = out / ".vignettes_videos"
+    thumbs.mkdir(exist_ok=True)
+    name = hashlib.sha1(file_id(v.path).encode()).hexdigest()[:16] + ".jpg"
+    t = thumbs / name
+    if not t.exists():
+        part = t.with_name(name + ".part.jpg")  # ffmpeg déduit le format de l'extension
+        at = min(1.0, v.duration / 2) if v.duration > 0 else 0
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-ss", f"{at:.2f}",
+                            "-i", v.path, "-frames:v", "1", "-vf", "scale=-2:240", "-q:v", "5",
+                            str(part)], capture_output=True)
+        if r.returncode or not part.exists():
+            part.unlink(missing_ok=True)
+            return ""  # vidéo illisible : pas de vignette
+        os.replace(part, t)
+    return f".vignettes_videos/{name}"
+
+
+def video_frames(v: Video, height: int = 384) -> list:
+    """3 images de la vidéo (à 20 %, 50 % et 80 % de sa durée ; une seule si elle dure
+    moins d'une seconde), décodées en mémoire par ffmpeg (rotation de l'iPhone appliquée)."""
+    import io
+    from PIL import Image
+    times = [v.duration * f for f in (0.2, 0.5, 0.8)] if v.duration >= 1 else [v.duration / 2]
+    frames = []
+    for t in times:
+        r = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{t:.2f}", "-i", v.path,
+                            "-frames:v", "1", "-vf", f"scale=-2:{height}", "-f", "image2pipe",
+                            "-vcodec", "mjpeg", "-"], capture_output=True)
+        if r.returncode == 0 and r.stdout:
+            try:
+                frames.append(Image.open(io.BytesIO(r.stdout)).convert("RGB"))
+            except OSError:
+                pass
+    return frames
+
+
+def video_embeddings(out: Path, videos: list[Video], model: str, pretrained: str, clip=None):
+    """Empreinte IA (CLIP) de chaque vidéo : moyenne des empreintes de 3 de ses images.
+    Renvoie ({chemin: empreinte}, modèle chargé ou None). Cache dans
+    .tri_photos/.cache_clip_videos.npz, sauvegardé toutes les minutes, à la fin et en
+    cas d'interruption : une analyse interrompue reprend où elle s'était arrêtée."""
+    import numpy as np
+    from concurrent.futures import ThreadPoolExecutor
+    from tri_ia import Clip
+    cache_file = out / ".cache_clip_videos.npz"
+    cache: dict = {}
+    if cache_file.exists():
+        try:
+            with np.load(cache_file, allow_pickle=True) as z:
+                cache = z["cache"].item()
+        except Exception as e:
+            log(f"! cache IA des vidéos illisible ({e}) : on le reconstruit.")
+
+    def save() -> None:
+        with atomic_open(cache_file, "wb") as f:
+            np.savez(f, cache=np.array(cache, dtype=object))
+
+    key = {v.path: f"{file_id(v.path)}|{model}/{pretrained}|3img" for v in videos}
+    todo = [v for v in videos if key[v.path] not in cache]
+    if todo:
+        if not shutil.which("ffmpeg"):
+            log("! ffmpeg introuvable : pas d'analyse IA des vidéos (sudo apt install ffmpeg).")
+            todo = []
+        else:
+            log(f"Analyse IA des vidéos : {len(videos) - len(todo)} en cache, {len(todo)} à analyser…")
+            clip = clip or Clip(model, pretrained)
+            every = Every(60)
+            try:
+                with ThreadPoolExecutor(max_workers=min(6, os.cpu_count() or 4)) as pool:
+                    for i in range(0, len(todo), 16):
+                        batch = todo[i:i + 16]
+                        frames = list(pool.map(video_frames, batch))
+                        flat = [im for fr in frames for im in fr]
+                        if flat:
+                            embs = clip.encode_images(flat)
+                            k = 0
+                            for v, fr in zip(batch, frames):
+                                if fr:
+                                    e = embs[k:k + len(fr)].mean(0)
+                                    cache[key[v.path]] = e / np.linalg.norm(e)
+                                    k += len(fr)
+                        log(f"  analyse IA vidéos {min(i + 16, len(todo))}/{len(todo)}")
+                        if every():
+                            save()
+            finally:
+                save()
+    return {v.path: cache[key[v.path]] for v in videos if key[v.path] in cache}, clip
+
+
+def scan_videos(source: str, quicktime_utc: bool = True) -> tuple[Path, list[Video]]:
+    """(dossier de travail, vidéos du dossier avec leurs métadonnées). Sert aussi à
+    tri_photos.py decouvrir --videos."""
+    src, out = work_dir(source)
+    out.mkdir(exist_ok=True)
+    files = sorted(p for p in src.rglob("*")
+                   if p.is_file() and p.suffix.lower() in VIDEO_EXT and out not in p.parents)
+    meta = read_metadata(files, quicktime_utc, out / ".cache_exif_videos.json")
+    return out, [build_video(f, meta.get(str(f), {})) for f in files]
+
+
+def find_categories(args, out: Path) -> Path | None:
+    """categories.json à appliquer : --categories, sinon celui du dossier analysé, sinon
+    celui du dossier de photos (--plan-photos), où tri_photos.py analyse le recopie."""
+    candidates = [Path(args.categories).expanduser()] if args.categories else []
+    candidates.append(out / "categories.json")
+    if args.plan_photos:
+        pp = Path(args.plan_photos).expanduser()
+        candidates.append((pp / PLAN_DIR if pp.is_dir() else pp.parent) / "categories.json")
+    return next((c for c in candidates if c.exists()), None)
+
+
+def make_video_thumbs(out: Path, videos: list[Video]) -> None:
+    """Vignettes en parallèle ; celles déjà faites sont reprises (interruption sans perte)."""
+    if not shutil.which("ffmpeg"):
+        log("ffmpeg introuvable : rapport sans vignettes (sudo apt install ffmpeg).")
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    every, done = Every(15), [0]
+
+    def one(v: Video) -> None:
+        v.thumb = make_video_thumb(out, v)
+        done[0] += 1
+        if every():
+            log(f"  vignettes {done[0]}/{len(videos)}")
+
+    log(f"Vignettes de {len(videos)} vidéos…")
+    with ThreadPoolExecutor(max_workers=min(6, os.cpu_count() or 4)) as pool:
+        list(pool.map(one, videos))
+
+
+# Lecteur du rapport : la lecture est lancée par play() DANS le clic. Firefox n'autorise
+# le son qu'en réponse directe à un clic ; un simple « autoplay » démarrant une fois la
+# vidéo chargée (disque USB lent à répondre) est bloqué. Si le son est quand même
+# refusé, la vidéo est lancée sans le son plutôt que de rester immobile.
+PLAYER = """<dialog id=player><video controls playsinline preload=auto></video>
+<div class=cap><span><b id=pname></b> <span class=msg id=pmsg></span></span>
+<button type=button id=pclose>Fermer (Échap)</button></div></dialog>
+<script>
+const dlg = document.getElementById('player'), vid = dlg.querySelector('video');
+const pmsg = document.getElementById('pmsg');
+function stop() { vid.pause(); vid.removeAttribute('src'); vid.load(); }
+document.querySelectorAll('.play').forEach(p => p.onclick = () => {
+  const src = p.parentElement.dataset.src;
+  document.getElementById('pname').textContent = decodeURIComponent(src.split('/').pop());
+  pmsg.textContent = '';
+  vid.muted = false;
+  vid.src = src;
+  dlg.showModal();
+  vid.play().catch(err => {
+    if (err.name !== 'NotAllowedError') return;
+    vid.muted = true;
+    pmsg.textContent = 'Son coupé par le navigateur : clique sur le haut-parleur pour le remettre.';
+    vid.play().catch(() => { pmsg.textContent = 'Lecture bloquée par le navigateur : clique sur ▶ dans le lecteur.'; });
+  });
+});
+vid.onerror = () => {
+  pmsg.textContent = 'Ce navigateur ne sait pas lire cette vidéo. Ouvre-la avec un lecteur vidéo : '
+    + decodeURIComponent(vid.currentSrc.replace('file://', ''));
+};
+document.getElementById('pclose').onclick = () => dlg.close();
+dlg.addEventListener('close', stop);
+dlg.addEventListener('click', ev => { if (ev.target === dlg) dlg.close(); });  // clic à côté
+</script>"""
+
+
 def write_report(out: Path, all_videos: list[Video]) -> None:
     # le rapport ne montre que ce qui va bouger ; la vidéo gardée d'un groupe de
     # copies est montrée à côté, même si elle est déjà rangée
@@ -521,7 +762,9 @@ def write_report(out: Path, all_videos: list[Video]) -> None:
         cls = " class=keep" if keep else ""
         tag = ("GARDÉE (déjà rangée) · " if v.pinned else "GARDÉE · ") if keep else ""
         return (f'<figure{cls} data-src="{html.escape(Path(v.path).as_uri())}">'
-                f'<div class=play>▶</div><figcaption><b>{tag}{html.escape(v.name)}</b>'
+                + (f'<div class="play thumb" style="background-image:url({html.escape(v.thumb)})">▶</div>'
+                   if v.thumb else '<div class=play>▶</div>')
+                + f'<figcaption><b>{tag}{html.escape(v.name)}</b>'
                 f'<br>{html.escape(info)}<br><i>{html.escape(v.reason)}</i></figcaption></figure>')
 
     total = sum(v.size for v in videos)
@@ -534,10 +777,21 @@ def write_report(out: Path, all_videos: list[Video]) -> None:
              "figcaption b{color:#ddd;word-break:break-all}"
              ".play{height:110px;display:flex;align-items:center;justify-content:center;"
              "font-size:32px;background:#222;border-radius:4px;cursor:pointer;color:#8cf}"
-             "video{width:100%;height:110px;background:#000;border-radius:4px}"
+             ".play.thumb{background-size:cover;background-position:center;color:#fff;"
+             "text-shadow:0 1px 6px #000,0 0 2px #000}.play.thumb:hover{filter:brightness(1.15)}"
              ".keep{outline:3px solid #3c3}table{border-collapse:collapse;font-size:13px}"
              "td{padding:2px 10px;border-bottom:1px solid #333}"
-             "nav a{color:#8cf;margin-right:12px;line-height:1.8}</style>"
+             "nav a{color:#8cf;margin-right:12px;line-height:1.8}"
+             "dialog#player{background:#000;border:0;padding:0;max-width:96vw;max-height:94vh;"
+             "border-radius:8px;overflow:visible}"
+             "dialog#player::backdrop{background:rgba(0,0,0,.85)}"
+             # grand cadre fixe : la vidéo s'y adapte (paysage ou portrait) sans déborder
+             "#player video{display:block;width:min(1280px,94vw);height:min(80vh,860px);"
+             "min-height:320px;object-fit:contain;background:#000}"
+             "#player .cap{color:#ddd;font-size:13px;padding:8px 10px;display:flex;gap:12px;"
+             "justify-content:space-between;align-items:center;background:#111}"
+             "#player .msg{color:#f0c060}#player button{background:#333;color:#eee;border:0;"
+             "border-radius:5px;padding:5px 10px;cursor:pointer}</style>"
              f"<h1>Plan de tri des vidéos</h1><p>{len(videos)} vidéos, {fmt_size(total)}. "
              "Clique sur ▶ pour lire une vidéo (rien n'est chargé avant).</p><nav>"]
     for d in order:
@@ -567,9 +821,7 @@ def write_report(out: Path, all_videos: list[Video]) -> None:
     for v in sorted(videos, key=lambda v: -v.size)[:30]:
         parts.append(f"<tr><td>{fmt_size(v.size)}</td><td>{fmt_dur(v.duration)}</td>"
                      f"<td>{html.escape(v.name)}</td><td>{html.escape(v.destination)}</td></tr>")
-    parts.append("</table><script>document.querySelectorAll('.play').forEach(p=>p.onclick=()=>{"
-                 "const v=document.createElement('video');v.controls=true;v.autoplay=true;"
-                 "v.src=p.parentElement.dataset.src;p.replaceWith(v);});</script>")
+    parts.append("</table>" + PLAYER)
     atomic_write_text(out / REPORT, "\n".join(parts))
 
 
@@ -579,6 +831,7 @@ def summary(all_videos: list[Video]) -> None:
     for v in videos:
         d = v.destination
         k = ("voyages" if d.startswith("Voyages/") else
+             "thèmes" if d.startswith("Themes/") else
              "similaires" if d.startswith("_A_REVOIR/similaires") else
              d if d.startswith("_A_REVOIR") else "par mois")
         n[k] += 1
@@ -603,6 +856,14 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("analyse", help="analyse et produit plan_videos.csv + rapport_videos.html")
     add_common_analyse_args(a, "vidéos")
+    a.add_argument("--categories",
+                   help="categories.json de la page de découverte (par défaut : celui du dossier, "
+                        "ou celui du dossier de photos --plan-photos)")
+    a.add_argument("--sans-ia", dest="ia", action="store_false",
+                   help="ne pas reconnaître les groupes de la page de découverte (pas de modèle "
+                        "d'IA, aucune dépendance en plus d'exiftool)")
+    a.add_argument("--model", default=DEFAULT_MODEL)
+    a.add_argument("--pretrained", default=DEFAULT_PRETRAINED)
     a.add_argument("--plan-photos",
                    help="dossier de photos analysé par tri_photos.py, ou son plan.csv "
                         f"(par défaut : <source>/{PLAN_DIR}/plan.csv s'il existe)")
@@ -619,6 +880,8 @@ def main() -> None:
                    help="écart de durée max (s) entre deux copies d'une même vidéo")
     a.add_argument("--dup-min-duration", type=float, default=3,
                    help="durée min pour chercher des copies ré-encodées")
+    a.add_argument("--sans-vignettes", dest="vignettes", action="store_false",
+                   help="ne pas extraire d'image de chaque vidéo pour le rapport (ffmpeg)")
     a.add_argument("--dates-locales", action="store_true",
                    help="les dates QuickTime de tes appareils sont en heure locale, pas en UTC "
                         "(certaines caméras / vieux appareils)")

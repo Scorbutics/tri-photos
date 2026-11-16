@@ -46,9 +46,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
+from tri_ia import DEFAULT_MODEL, DEFAULT_PRETRAINED, Clip, Groups
 from tri_commun import (IMAGE_EXT, Every, Plan, add_common_analyse_args, atomic_open,
                         atomic_write_text, file_id, find_trips, log, parse_exif_date,
-                        run_command, run_exiftool, safe_name, settle_group, similar_folder,
+                        run_command, run_exiftool, settle_group, similar_folder,
                         sorted_folder, trip_label, work_dir)
 
 PLAN = Plan("plan.csv", "deplacements_", "photos")
@@ -137,10 +138,17 @@ class Photo:
     dup_folder: str = ""             # _A_REVOIR/similaires/<photo de référence>
     dup_note: str = ""
     pinned: str = ""                 # dossier actuel si déjà rangée (on n'y touche pas)
+    category_note: str = ""          # raison d'une catégorie trouvée par une règle (pas par le modèle)
+    thumb_src: str = ""              # vidéo (decouvrir --videos) : sa vignette, faite par tri_videos.py
     theme: str = ""
     destination: str = ""
     reason: str = ""
     emb: np.ndarray | None = field(default=None, repr=False)
+
+    @property
+    def has_origin(self) -> bool:
+        """Prise par un appareil identifiable (marque dans les EXIF) ou géolocalisée."""
+        return bool(self.make) or self.lat is not None
 
 
 # ---------------------------------------------------------------------------
@@ -188,37 +196,7 @@ def quality_metrics(im: Image.Image) -> tuple[float, float, float, float]:
 # ---------------------------------------------------------------------------
 # CLIP local
 # ---------------------------------------------------------------------------
-class Clip:
-    def __init__(self, model_name: str, pretrained: str):
-        import open_clip
-        import torch
-        self.torch = torch
-        torch.set_num_threads(max(1, os.cpu_count() or 1))
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        log(f"Chargement du modèle CLIP {model_name}/{pretrained} sur {self.device} "
-            "(premier lancement : téléchargement unique)…")
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            model_name, pretrained=pretrained, device=self.device)
-        self.model.eval()
-        self.tokenizer = open_clip.get_tokenizer(model_name)
-
-    def encode_images(self, ims: list[Image.Image]) -> np.ndarray:
-        t = self.torch.stack([self.preprocess(im) for im in ims]).to(self.device)
-        with self.torch.no_grad():
-            f = self.model.encode_image(t).float()
-        f /= f.norm(dim=-1, keepdim=True)
-        return f.cpu().numpy()
-
-    def encode_categories(self, cats: dict[str, list[str]]) -> tuple[list[str], np.ndarray]:
-        names, vecs = [], []
-        for name, prompts in cats.items():
-            with self.torch.no_grad():
-                f = self.model.encode_text(self.tokenizer(prompts).to(self.device)).float()
-            f /= f.norm(dim=-1, keepdim=True)
-            v = f.mean(0)
-            vecs.append((v / v.norm()).cpu().numpy())
-            names.append(name)
-        return names, np.stack(vecs)
+# (classe Clip : voir tri_ia.py)
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +362,14 @@ def analyse(args) -> None:
         if clip is None:
             clip = Clip(args.model, args.pretrained)
         rev_names, rev_vecs = clip.encode_categories(REVIEW_CATEGORIES)
-        keep_names, keep_vecs = clip.encode_categories(KEEP_CATEGORIES)
+        # Chaque description « photo normale » est un concurrent à part entière : leur
+        # moyenne (22 sujets très différents) ne ressemble à rien et perdait toujours
+        # face aux catégories à revoir, bien plus homogènes (photos normales classées
+        # « ratées » à 99 %). Une photo n'est donc à revoir que si une catégorie à revoir
+        # l'emporte sur CHAQUE façon d'être une photo normale.
+        keep_names, keep_vecs = clip.encode_categories(
+            {f"{name}:{k}": [prompt] for name, prompts in KEEP_CATEGORIES.items()
+             for k, prompt in enumerate(prompts)})
         all_names = rev_names + keep_names
         all_vecs = np.concatenate([rev_vecs, keep_vecs])
     for p in new:
@@ -396,9 +381,21 @@ def analyse(args) -> None:
         i = int(prob.argmax())
         if all_names[i] in rev_names and prob[i] >= args.category_threshold:
             p.category, p.category_score = all_names[i], float(prob[i])
-        # capture d'écran évidente : PNG sans marque d'appareil
-        if (not p.category and Path(p.path).suffix.lower() == ".png" and not p.make):
-            p.category, p.category_score = "captures_ecran", -1.0
+        # Règles sur l'origine de la photo (marque d'appareil : iPhone « Apple »,
+        # Samsung « samsung »…). Sans appareil, la photo n'a pas été prise par un
+        # appareil photo : capture d'écran, image reçue ou téléchargée.
+        if p.category or p.make:
+            continue
+        tall = max(p.width, p.height) / max(1, min(p.width, p.height))
+        if Path(p.path).suffix.lower() == ".png":
+            p.category, p.category_note = "captures_ecran", "png sans appareil photo"
+        elif tall >= 1.95:  # 1080x2400 (Samsung), 1179x2556 (iPhone 15 Pro)…
+            p.category = "captures_ecran"
+            p.category_note = f"format d'écran de téléphone ({p.width}x{p.height}), sans appareil"
+        elif p.date_source == "fichier" and p.lat is None:
+            p.category = "messagerie"
+            p.category_note = ("ni appareil ni date : image reçue (WhatsApp…) ou téléchargée, "
+                               "datée de son enregistrement sur le téléphone")
 
     # --- 2. qualité (seulement pour les nouvelles photos non catégorisées)
     for p in new:
@@ -457,10 +454,13 @@ def analyse(args) -> None:
     # --- 4. voyages / mois. Les photos déjà rangées (hors _A_REVOIR) participent à la
     # détection : une nouvelle photo prise pendant un voyage existant rejoint son dossier.
     home = (args.home_lat, args.home_lon)
-    kept = sorted((p for p in photos
-                   if (p.pinned and not p.pinned.startswith("_A_REVOIR"))
-                   or (not p.pinned and not p.category and not p.quality_flag and p.dup_keep)),
-                  key=lambda p: p.date)
+    kept_all = sorted((p for p in photos
+                       if (p.pinned and not p.pinned.startswith("_A_REVOIR"))
+                       or (not p.pinned and not p.category and not p.quality_flag and p.dup_keep)),
+                      key=lambda p: p.date)
+    # Les voyages ne sont cherchés que parmi les photos d'origine connue (appareil ou GPS) :
+    # une image reçue pendant un voyage ne doit pas en hériter, ni le découper.
+    kept = [p for p in kept_all if p.pinned or p.has_origin]
     ts = [dt.datetime.fromisoformat(p.date) for p in kept]
     trips = find_trips(kept, ts, home, args.trip_km, args.trip_gap_days)
 
@@ -488,15 +488,18 @@ def analyse(args) -> None:
             for i in fresh:
                 in_trip[i] = folder
 
-    for i, p in enumerate(kept):
+    trip_of = {id(kept[i]): folder for i, folder in in_trip.items()}
+    for p in kept_all:
         if p.pinned:
             continue
-        if i in in_trip:
-            p.destination, p.reason = in_trip[i], "voyage"
+        d = dt.datetime.fromisoformat(p.date)
+        if id(p) in trip_of:
+            p.destination, p.reason = trip_of[id(p)], "voyage"
         elif p.theme:
             p.destination, p.reason = f"Themes/{p.theme}", "thème"
         else:
-            p.destination, p.reason = f"{ts[i]:%Y}/{ts[i]:%Y-%m}", "mois"
+            p.destination = f"{d:%Y}/{d:%Y-%m}"
+            p.reason = "mois" if p.has_origin else "mois · origine inconnue (ni appareil ni lieu)"
 
     for p in photos:
         if p.destination:
@@ -505,7 +508,7 @@ def analyse(args) -> None:
             p.destination, p.reason = p.pinned, "déjà rangée"
         elif p.category:
             p.destination = f"_A_REVOIR/{p.category}"
-            p.reason = ("png sans appareil photo" if p.category_score < 0
+            p.reason = (p.category_note if p.category_note
                         else "groupe découvert" if p.category_score > 1
                         else f"modèle {p.category_score:.0%}")
         elif p.quality_flag:
@@ -537,6 +540,12 @@ def make_thumb(out: Path, p: Photo) -> str:
     thumbs = out / ".vignettes"
     thumbs.mkdir(exist_ok=True)
     name = hashlib.sha1(file_id(p.path).encode()).hexdigest()[:16] + ".jpg"
+    if p.thumb_src:  # vidéo : on recopie l'image extraite par tri_videos.py (préfixe v_)
+        t = thumbs / ("v_" + name)
+        if not t.exists():
+            with atomic_open(t, "wb") as f:
+                f.write(Path(p.thumb_src).read_bytes())
+        return f".vignettes/{t.name}"
     t = thumbs / name
     if not t.exists():
         im = load_rgb(p.path, 240)
@@ -726,6 +735,20 @@ def discover(args) -> None:
 
     photos, images, clip, out = load_photos(args)
     imgs = [p for p in images if p.emb is not None]
+    n_videos = 0
+    if args.videos:  # les vidéos sont regroupées avec les photos (empreinte de 3 de leurs images)
+        import tri_videos
+        vwork, vids = tri_videos.scan_videos(args.videos)
+        vids = [v for v in vids if v.duration > 0]
+        clip = clip or Clip(args.model, args.pretrained)
+        embs, clip = tri_videos.video_embeddings(vwork, vids, args.model, args.pretrained, clip)
+        tri_videos.make_video_thumbs(vwork, vids)
+        for v in vids:
+            if v.path in embs and v.thumb:
+                imgs.append(Photo(path=v.path, date=v.date, emb=embs[v.path],
+                                  thumb_src=str(vwork / v.thumb)))
+                n_videos += 1
+        log(f"{n_videos} vidéos ajoutées au regroupement.")
     if len(imgs) < 2:
         sys.exit("Pas assez d'images.")
     E = np.stack([p.emb for p in imgs]).astype(np.float64)
@@ -758,7 +781,8 @@ def discover(args) -> None:
         centre = [round(float(x), 5) for x in c]
         clusters.append({
             "id": cluster_id(centre), "nom": top[0], "action": "garder", "vu": False,
-            "nb": len(members), "suggestions": top, "seuil": round(seuil, 4),
+            "nb": len(members), "videos": sum(1 for p in members if p.thumb_src),
+            "suggestions": top, "seuil": round(seuil, 4),
             "centre": centre,
         })
         ordered.append([members[i] for i in np.argsort(-sims)])  # les plus typiques d'abord
@@ -771,7 +795,8 @@ def discover(args) -> None:
         cl["photos"] = thumbs[k:k + len(members)]
         k += len(members)
     restore_choices(clusters, out)
-    data = {"source": str(src), "total": len(imgs), "small": small, "grain": args.grain,
+    data = {"source": str(src), "total": len(imgs), "videos": n_videos, "small": small,
+            "grain": args.grain,
             "clusters": clusters}
     atomic_write_text(out / "decouverte.json", json.dumps(data))
     write_discovery_page(out, data)
@@ -871,6 +896,9 @@ button{font:inherit}
 .thumbs{display:flex;flex-wrap:wrap;gap:4px}
 .thumbs img{width:104px;height:78px;object-fit:cover;border-radius:3px;background:#222;transition:transform .12s;cursor:zoom-in}
 .thumbs img:hover{transform:scale(2.2);position:relative;z-index:3;box-shadow:0 4px 18px #000}
+.thumbs .vid{position:relative;display:inline-block;line-height:0}
+.thumbs .vid::after{content:'▶';position:absolute;left:5px;bottom:4px;color:#fff;font-size:14px;
+  line-height:1;text-shadow:0 0 4px #000,0 0 2px #000;pointer-events:none}
 .more{margin-top:8px;background:none;border:1px solid var(--line);color:var(--accent);border-radius:6px;padding:5px 10px;cursor:pointer;font-size:13px}
 .empty{color:var(--muted);padding:30px 0;text-align:center}
 
@@ -1081,7 +1109,7 @@ function card(comp) {
   const sset = [...new Set(comp.members.flatMap(m => m.suggestions))].slice(0, 5);
   for (const s of sset) sugg.append(el('a', {onclick: () => { c.nom = s; c.vu = true; changed(); }}, s));
   const head = el('div', {class: 'ghead'},
-    el('div', {class: 'num'}, box, el('b', {}, '#' + (c.i + 1)), comp.nb + ' photos'),
+    el('div', {class: 'num'}, box, el('b', {}, '#' + (c.i + 1)), countLabel(comp)),
     el('div', {class: 'name'}, el('label', {}, 'Nom (dossier)'), input), seg, sugg);
   const sec = el('section', {class: 'group ' + c.action + (c.vu ? '' : ' unseen') + (selected.has(c.id) ? ' selected' : ''), id: 'g' + (c.i + 1)}, head, effect);
   if (multi) {
@@ -1095,7 +1123,10 @@ function card(comp) {
   const all = comp.members.flatMap(m => m.photos);
   const thumbs = el('div', {class: 'thumbs'});
   const open = expanded.has(c.id);
-  for (const p of open ? all : all.slice(0, SHOWN)) thumbs.append(el('img', {loading: 'lazy', src: p, alt: ''}));
+  for (const p of open ? all : all.slice(0, SHOWN)) {
+    const img = el('img', {loading: 'lazy', src: p, alt: ''});
+    thumbs.append(p.includes('/v_') ? el('span', {class: 'vid', title: 'Vidéo'}, img) : img);
+  }
   sec.append(thumbs);
   const partial = comp.members.some(m => m.partiel);
   if (all.length > SHOWN) {
@@ -1105,6 +1136,10 @@ function card(comp) {
     sec.append(el('p', {class: 'sugg'}, `${all.length} photos montrées sur ${comp.nb} (ancienne découverte, voir l'encadré en haut).`));
   }
   return sec;
+}
+function countLabel(comp) {
+  const v = comp.members.reduce((s, m) => s + (m.videos || 0), 0), p = comp.nb - v;
+  return [p ? `${p} photo${p > 1 ? 's' : ''}` : '', v ? `${v} vidéo${v > 1 ? 's' : ''}` : ''].filter(Boolean).join(' · ');
 }
 function render() {
   partition();
@@ -1195,7 +1230,7 @@ document.getElementById('resetBtn').onclick = () => {
 // --- Démarrage
 const grain = DATA.grain || 0.25;
 document.getElementById('intro').textContent =
-  `${DATA.total} photos analysées dans ${DATA.source} : ${N} groupes de photos qui se ressemblent`
+  `${DATA.total - (DATA.videos || 0)} photos${DATA.videos ? ` et ${DATA.videos} vidéos` : ''} analysées dans ${DATA.source} : ${N} groupes qui se ressemblent`
   + ` (+ ${DATA.small} photos isolées). Pour chaque groupe, choisis ce qu'il faut en faire.`;
 document.getElementById('grainCmd').textContent =
   `python ${DATA.script} decouvrir "${DATA.source}" --grain ${Math.max(0.1, Math.round((grain - 0.05) * 100) / 100)}`;
@@ -1213,26 +1248,21 @@ render();
 
 
 def apply_discovered(images: list[Photo], path: Path) -> None:
-    cats = [c for c in json.loads(path.read_text()) if c.get("action") in ("revoir", "theme")]
-    if not cats:
+    groups = Groups(path)
+    if not groups:
         return
-    C = np.stack([np.array(c["centre"]) for c in cats])
-    seuils = np.array([c["seuil"] for c in cats])
     n = 0
     for p in images:
-        if p.emb is None:
+        found = groups.match(p.emb)
+        if not found:
             continue
-        sims = C @ p.emb
-        i = int(np.argmax(sims))
-        if sims[i] < seuils[i]:
-            continue
-        nom = safe_name(cats[i]["nom"]) or "groupe"
-        if cats[i]["action"] == "revoir":
+        action, nom = found
+        if action == "revoir":
             p.category, p.category_score = nom, 2.0
         else:
             p.theme = nom
         n += 1
-    log(f"Catégories découvertes : {n} photos rattachées à {len(cats)} groupe(s) nommé(s).")
+    log(f"Catégories découvertes : {n} photos rattachées à {len(groups)} groupe(s) nommé(s).")
 
 
 # ---------------------------------------------------------------------------
@@ -1258,19 +1288,21 @@ def main() -> None:
                    help="variance du laplacien sous laquelle une photo est floue")
     a.add_argument("--categories", help="categories.json produit par la commande decouvrir "
                    f"(recopié dans .tri_photos/ et réutilisé ensuite automatiquement)")
-    a.add_argument("--model", default="ViT-B-32")
-    a.add_argument("--pretrained", default="laion2b_s34b_b79k")
+    a.add_argument("--model", default=DEFAULT_MODEL)
+    a.add_argument("--pretrained", default=DEFAULT_PRETRAINED)
     a.set_defaults(func=analyse)
     d = sub.add_parser("decouvrir", help="regroupe les photos par ressemblance pour que tu nommes les groupes")
     d.add_argument("source", help="dossier de photos")
     d.add_argument("--grain", type=float, default=0.25,
                    help="plus petit = groupes plus nombreux et plus précis (0.15-0.35)")
     d.add_argument("--min-group", type=int, default=6, help="taille minimale d'un groupe affiché")
+    d.add_argument("--videos", help="dossier de vidéos à regrouper avec les photos : tes choix "
+                   "s'appliqueront aussi aux vidéos (tri_videos.py analyse)")
     d.add_argument("--page-seule", action="store_true",
                    help="régénérer seulement decouverte.html à partir de la dernière découverte "
                         "(rien n'est recalculé, aucun modèle chargé)")
-    d.add_argument("--model", default="ViT-B-32")
-    d.add_argument("--pretrained", default="laion2b_s34b_b79k")
+    d.add_argument("--model", default=DEFAULT_MODEL)
+    d.add_argument("--pretrained", default=DEFAULT_PRETRAINED)
     d.set_defaults(func=discover)
     PLAN.add_commands(sub)
     args = ap.parse_args()

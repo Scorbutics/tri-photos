@@ -30,6 +30,10 @@ IMAGE_EXT = {".jpg", ".jpeg", ".png", ".heic", ".heif", ".webp", ".tif", ".tiff"
 # par les deux scripts : leurs fichiers ont des noms distincts.
 PLAN_DIR = ".tri_photos"
 
+# Modèle d'IA (CLIP) utilisé par défaut pour les empreintes d'images (voir tri_ia.py)
+DEFAULT_MODEL = "ViT-B-32"
+DEFAULT_PRETRAINED = "laion2b_s34b_b79k"
+
 # Dossiers de premier niveau de la structure triée (plus AAAA/AAAA-MM/)
 SORTED_TOP = {"_A_REVOIR", "Voyages", "Themes"}
 

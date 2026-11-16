@@ -4,7 +4,7 @@
 
 ```bash
 sudo apt install libimage-exiftool-perl python3-venv
-mkdir ~/tri-photos && cd ~/tri-photos        # y copier tri_photos.py, tri_videos.py et tri_commun.py
+mkdir ~/tri-photos && cd ~/tri-photos        # y copier tri_photos.py, tri_videos.py, tri_commun.py et tri_ia.py
 python3 -m venv .venv && . .venv/bin/activate
 # torch ET torchvision depuis l'index CPU, ensemble : sinon open_clip installe un
 # torchvision incompatible (erreur « operator torchvision::nms does not exist »)
@@ -98,6 +98,7 @@ La page sert aussi à ajuster les groupes :
 
 - `--grain` (0.25 par défaut) : plus petit = plus de groupes, plus précis. Pour des groupes **plus fins** que la première découverte, relance `decouvrir --grain 0.2`. L'analyse des images est en cache, donc la relance prend environ une minute. Pour des groupes **plus larges**, utilise plutôt le curseur de la page.
 - `--min-group` (6) : taille minimale d'un groupe affiché.
+- `--videos DOSSIER` : regroupe aussi les vidéos de ce dossier avec les photos. L'IA analyse 3 images de chaque vidéo, et ces vidéos sont marquées ▶ dans la page. Tes choix s'appliqueront alors aux vidéos (voir « Vidéos »).
 - `--page-seule` : régénère seulement `decouverte.html` à partir de la dernière découverte, en une seconde. Rien n'est recalculé et aucun modèle n'est chargé.
 - Relancer `decouvrir` (par exemple avec de nouvelles photos) garde les noms et choix déjà donnés aux groupes qui se retrouvent.
 - `categories.json` contient le « portrait moyen » de chaque groupe. Il resservira pour les photos des prochaines années : une nouvelle photo de reçu ira toute seule dans `_A_REVOIR/Reçus`.
@@ -146,11 +147,38 @@ A_trier/            (ou Trie/)
 | `--blur-threshold` | 60 | Plus bas = moins de photos jugées floues. |
 | `--home-lat/--home-lon` | Brisbane | Ville de référence. |
 
+### Origine des photos et vidéos
+
+La marque de l'appareil est lue dans les métadonnées. Pour les iPhone, c'est « Apple ». Pour les Samsung, c'est « samsung » dans les photos, et une balise propre à Samsung (`SamsungModel`) dans les vidéos. Les autres téléphones Android utilisent leurs propres balises.
+
+Une photo ou une vidéo **sans marque d'appareil** n'a pas été prise par un appareil photo :
+
+- **Format d'écran de téléphone** (1080x2400, 1179x2556…), ou PNG : `_A_REVOIR/captures_ecran`.
+- **Ni date ni lieu** : image ou vidéo reçue (WhatsApp…) ou téléchargée. Sa seule date est celle de son enregistrement sur le téléphone. Elle va dans `_A_REVOIR/messagerie` : les photos, sauf si le modèle lui trouve une catégorie plus précise ; les vidéos, seulement si elles sont en basse définition.
+- **Dans tous les cas**, elle n'est jamais rattachée à un voyage d'après sa date : reçue pendant un voyage, elle n'en fait pas partie. Elle va dans le dossier du mois, avec la mention « origine inconnue » dans le rapport.
+
 Les catégories sont des phrases en anglais en haut du script (`REVIEW_CATEGORIES`). Tu peux en ajouter, par exemple `"plantes_jardin": ["a photo of a plant label", ...]`.
 
 ## Vidéos (`tri_videos.py`)
 
-Aucune vidéo n'est décodée et aucun modèle n'est utilisé. Le script ne lit que les métadonnées (exiftool), le nom et la taille des fichiers. Il traite des milliers de vidéos en quelques secondes et n'a besoin d'aucune dépendance en plus d'exiftool. `reverse_geocoder` est optionnel et sert à nommer les voyages.
+Le tri repose sur les métadonnées (exiftool), le nom et la taille des fichiers : des milliers de vidéos en quelques secondes. `reverse_geocoder` est optionnel et sert à nommer les voyages. Avec `ffmpeg`, chaque vidéo a une vignette dans le rapport (`--sans-vignettes` pour s'en passer).
+
+**Thèmes et groupes « à revoir », comme pour les photos.** Si un `categories.json` existe (celui de la page de découverte), l'IA regarde 3 images de chaque vidéo. Une vidéo qui ressemble à un groupe « Dossier thème » va dans `Themes/<nom>/`, sauf si elle a été filmée pendant un voyage. Une vidéo qui ressemble à un groupe « À revoir » va dans `_A_REVOIR/<nom>/`. Le fichier est cherché à trois endroits, dans cet ordre :
+
+1. `--categories` ;
+2. `.tri_photos/` du dossier de vidéos ;
+3. `.tri_photos/` du dossier de photos donné par `--plan-photos`, où `tri_photos.py analyse` le recopie.
+
+L'analyse IA est mise en cache et peut être interrompue. Elle demande les mêmes dépendances que `tri_photos.py`. `--sans-ia` s'en passe complètement : dans ce cas, seuls exiftool (et ffmpeg pour les vignettes) sont nécessaires.
+
+Pour que tes choix tiennent compte des vidéos, lance la découverte avec elles :
+
+```bash
+python tri_photos.py decouvrir ~/Photos/A_trier --videos ~/Videos/A_trier
+# choisis dans la page, enregistre categories.json, puis :
+python tri_photos.py analyse ~/Photos/A_trier --categories ~/Téléchargements/categories.json
+python tri_videos.py analyse ~/Videos/A_trier --plan-photos ~/Photos/A_trier
+```
 
 Mêmes commandes et même fonctionnement que pour les photos, y compris pour ajouter des vidéos à un dossier déjà trié et pour `--tout-refaire`. Le plan (`plan_videos.csv` + `rapport_videos.html`) va dans le même dossier `.tri_photos/`, avec des noms de fichiers distincts, et chaque script n'annule que ses propres `apply`.
 
@@ -172,7 +200,7 @@ Si le plan des photos existe, une vidéo prise pendant un voyage trouvé par les
 | `live_photos` | ≤ 4 s, et identifiant Live Photo Apple ou photo du même nom à côté |
 | `enregistrements_ecran` | nom (`RPReplay`, `Screen Recording`…), ou format d'écran ≥ 19,5:9 sans marque d'appareil |
 | `similaires/` | même durée (±0,15 s), même format, même moment : copie ré-encodée. La meilleure qualité est gardée |
-| `messagerie` | dossier ou nom WhatsApp / Telegram / Signal / Messenger, sans marque d'appareil |
+| `messagerie` | dossier ou nom WhatsApp / Telegram / Signal / Messenger, sans marque d'appareil ; ou ni appareil, ni date, et basse définition (vidéo compressée par une messagerie) |
 | `tres_courtes` | < 2 s (`--min-duration`) |
 
 Le rapport indique la taille de chaque dossier et liste les 30 vidéos les plus lourdes. Clique sur ▶ pour lire une vidéo : elle ne se charge qu'à ce moment-là.
