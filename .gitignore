@@ -1,0 +1,10 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+
+# Captures de tests (contiennent des photos personnelles)
+.playwright-mcp/
+
+# Dossier de travail des scripts s'il se retrouve ici (plan, caches, vignettes)
+.tri_photos/
